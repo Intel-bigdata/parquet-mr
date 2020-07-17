@@ -37,6 +37,11 @@
 
   <dependencies>
     <dependency>
+      <groupId>com.intel.arrow</groupId>
+      <artifactId>arrow-plasma</artifactId>
+      <version>${plasma.version}</version>
+    </dependency>
+    <dependency>
       <groupId>org.apache.parquet</groupId>
       <artifactId>parquet-column</artifactId>
       <version>${project.version}</version>
@@ -109,6 +114,12 @@
       <artifactId>slf4j-simple</artifactId>
       <version>${slf4j.version}</version>
       <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>28.2-jre</version>
+      <scope>compile</scope>
     </dependency>
   </dependencies>
 
