@@ -31,22 +31,30 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.SequenceInputStream;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
+
 import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Set;
+import java.util.Map;
+import java.util.List;
+import java.util.Map.Entry;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+import com.google.common.hash.Hashing;
+import org.apache.arrow.plasma.PlasmaClient;
+import org.apache.arrow.plasma.exceptions.DuplicateObjectException;
+import org.apache.arrow.plasma.exceptions.ObjectHitCountNotReachedKException;
+import org.apache.arrow.plasma.exceptions.PlasmaClientException;
+import org.apache.arrow.plasma.exceptions.PlasmaGetException;
+import org.apache.arrow.plasma.exceptions.PlasmaOutOfMemoryException;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -102,7 +110,9 @@ public class ParquetFileReader implements Closeable {
   public static String PARQUET_READ_PARALLELISM = "parquet.metadata.read.parallelism";
 
   private final ParquetMetadataConverter converter;
-
+  
+  private HashMap<byte[], Long> objectIds = new HashMap<>(500);
+  
   /**
    * for files provided, check if there's a summary file.
    * If a summary file is found it is used otherwise the file footer is used.
@@ -802,7 +812,7 @@ public class ParquetFileReader implements Closeable {
     }
     // actually read all the chunks
     for (ConsecutiveChunkList consecutiveChunks : allChunks) {
-      final List<Chunk> chunks = consecutiveChunks.readAll(f);
+      final List<Chunk> chunks = consecutiveChunks.readAll(f, currentBlock);
       for (Chunk chunk : chunks) {
         currentRowGroup.addColumn(chunk.descriptor.col, chunk.readAllPages());
       }
@@ -910,6 +920,18 @@ public class ParquetFileReader implements Closeable {
         f.close();
       }
     } finally {
+      // cache release logic
+      for(Entry<byte[], Long> entry : objectIds.entrySet()) {
+        for(long i = 0 ; i < entry.getValue(); i++) {
+          try {
+            plasmaClient.release(entry.getKey());
+          } catch (PlasmaClientException e) {
+            LOG.warn("release exception: " + e.getMessage());
+            continue;
+          }
+        }
+      }
+      objectIds.clear();
       options.getCodecFactory().release();
     }
   }
@@ -1091,6 +1113,30 @@ public class ParquetFileReader implements Closeable {
 
   }
 
+  private static String plasmaCacheSocket = "/tmp/plasmaStore";
+  public static PlasmaClient plasmaClient;
+
+  public byte[] hash(String key){
+    byte[] res= new byte[20];
+    Hashing.murmur3_128().newHasher().putBytes(key.getBytes()).hash().writeBytesTo(res, 0, 20);
+    return res;
+  }
+
+  /**
+   * initialize plasma Clients
+   */
+  static {
+    try {
+      System.loadLibrary("plasma_java");
+    } catch (Exception e) {
+      LOG.error("load plasma jni lib failed" + e.getMessage());
+    }
+    try {
+      plasmaClient = new PlasmaClient(plasmaCacheSocket, "", 0);
+    } catch (Exception e){
+      LOG.error("Error occurred when connecting to plasma server: " + e.getMessage());
+    }
+  }
 
   /**
    * information needed to read a column chunk
@@ -1120,13 +1166,14 @@ public class ParquetFileReader implements Closeable {
       this.size = size;
     }
   }
-
-  /**
+      
+    /**
    * describes a list of consecutive column chunks to be read at once.
    */
   private class ConsecutiveChunkList {
 
     private final long offset;
+    private long currentOffSet;
     private int length;
     private final List<ChunkDescriptor> chunks = new ArrayList<ChunkDescriptor>();
 
@@ -1135,6 +1182,7 @@ public class ParquetFileReader implements Closeable {
      */
     ConsecutiveChunkList(long offset) {
       this.offset = offset;
+      this.currentOffSet = offset;
     }
 
     /**
@@ -1152,42 +1200,60 @@ public class ParquetFileReader implements Closeable {
      * @return the chunks
      * @throws IOException if there is an error while reading from the stream
      */
-    public List<Chunk> readAll(SeekableInputStream f) throws IOException {
+    public List<Chunk> readAll(SeekableInputStream f, int currentBlock) throws IOException {
       List<Chunk> result = new ArrayList<Chunk>(chunks.size());
-      f.seek(offset);
-
-      int fullAllocations = length / options.getMaxAllocationSize();
-      int lastAllocationSize = length % options.getMaxAllocationSize();
-
-      int numAllocations = fullAllocations + (lastAllocationSize > 0 ? 1 : 0);
-      List<ByteBuffer> buffers = new ArrayList<>(numAllocations);
-
-      for (int i = 0; i < fullAllocations; i += 1) {
-        buffers.add(options.getAllocator().allocate(options.getMaxAllocationSize()));
-      }
-
-      if (lastAllocationSize > 0) {
-        buffers.add(options.getAllocator().allocate(lastAllocationSize));
-      }
-
-      for (ByteBuffer buffer : buffers) {
-        f.readFully(buffer);
-        buffer.flip();
-      }
-
-      // report in a counter the data we just scanned
-      BenchmarkCounter.incrementBytesRead(length);
-      ByteBufferInputStream stream = ByteBufferInputStream.wrap(buffers);
       for (int i = 0; i < chunks.size(); i++) {
         ChunkDescriptor descriptor = chunks.get(i);
+        byte[] objectId = hash(file.toString() + currentBlock + descriptor.fileOffset);
+        List<ByteBuffer> byteBufferList = new ArrayList<>();
+        ByteBuffer byteBuffer = null;
+        if (plasmaClient.contains(objectId)) {
+            try {
+              byteBuffer = plasmaClient.getObjAsByteBuffer(objectId, -1, false);
+              objectIds.put(objectId,objectIds.getOrDefault(objectId, 0l) + 1);
+            } catch (PlasmaGetException e) {
+              LOG.warn("PlasmaGetException: " + e.getMessage());
+              byte[] bytes = new byte[descriptor.size];
+              f.readFully(bytes, (int)currentOffSet, descriptor.size);
+              byteBuffer = ByteBuffer.wrap(bytes);
+            }
+          byteBufferList.add(byteBuffer);
+        } else {
+          f.seek(currentOffSet);
+          try {
+            byteBuffer = plasmaClient.create(objectId, descriptor.size);
+            f.readFully(byteBuffer);
+            byteBuffer.flip();
+            plasmaClient.seal(objectId);
+            objectIds.put(objectId,objectIds.getOrDefault(objectId, 0l) + 1);
+          } catch (PlasmaOutOfMemoryException e) {
+            LOG.warn("not enough memory on pmem for allocation");
+            byte[] bytes = new byte[descriptor.size];
+            f.readFully(bytes, (int)currentOffSet, descriptor.size);
+            byteBuffer = ByteBuffer.wrap(bytes);
+          } catch (DuplicateObjectException dpoe) {
+            LOG.warn("Duplicate Object: " + dpoe.getMessage());
+            byteBuffer = plasmaClient.getObjAsByteBuffer(objectId, -1, false);
+            objectIds.put(objectId,objectIds.getOrDefault(objectId, 0l) + 1);
+          } catch (ObjectHitCountNotReachedKException e) {
+            LOG.warn(objectId + " not reached LRU_K, will read from disk.");
+            byte[] bytes = new byte[descriptor.size];
+            f.readFully(bytes, (int)currentOffSet, descriptor.size);
+            byteBuffer = ByteBuffer.wrap(bytes);
+          } 
+          byteBufferList.add(byteBuffer);
+        }
         if (i < chunks.size() - 1) {
-          result.add(new Chunk(descriptor, stream.sliceBuffers(descriptor.size)));
+          result.add(new Chunk(descriptor, byteBufferList));
         } else {
           // because of a bug, the last chunk might be larger than descriptor.size
-          result.add(new WorkaroundChunk(descriptor, stream.sliceBuffers(descriptor.size), f));
+          result.add(new WorkaroundChunk(descriptor, byteBufferList, f));
         }
+        currentOffSet += descriptor.size;
       }
-      return result ;
+      // report in a counter the data we just scanned
+      BenchmarkCounter.incrementBytesRead(length);
+      return result;
     }
 
     /**
