@@ -138,6 +138,12 @@ public class CodecFactory implements CompressionCodecFactory {
     private final CompressionCodecName codecName;
 
     HeapBytesCompressor(CompressionCodecName codecName) {
+      if (codecName == CompressionCodecName.GZIP) {
+        boolean qatEnable = configuration.getBoolean("io.compression.codec.qat.enable", false);
+        if (qatEnable) {
+          codecName = CompressionCodecName.QAT;
+        }
+      }
       this.codecName = codecName;
       this.codec = getCodec(codecName);
       if (codec != null) {
@@ -217,6 +223,12 @@ public class CodecFactory implements CompressionCodecFactory {
    * @return the corresponding hadoop codec. null if UNCOMPRESSED
    */
   protected CompressionCodec getCodec(CompressionCodecName codecName) {
+    if (codecName == CompressionCodecName.GZIP) {
+      boolean qatEnable = configuration.getBoolean("io.compression.codec.qat.enable", false);
+      if (qatEnable) {
+        codecName = CompressionCodecName.QAT;
+      }
+    }
     String codecClassName = codecName.getHadoopCompressionCodecClassName();
     if (codecClassName == null) {
       return null;
